@@ -27,24 +27,24 @@ datasource db {
 // code-owned, closed set (see ROLES in lib/roles.js), not something an
 // admin can invent a fourth one of.
 model User {
-  id                String   @id @default(cuid())
-  email             String   @unique
-  passwordHash      String
-  name              String
-  role              String   @default("CONSULTANT") // ADMIN | CONSULTANT | VIEWER
-  isActive          Boolean  @default(true)
+  id           String  @id @default(cuid())
+  email        String  @unique
+  passwordHash String
+  name         String
+  role         String  @default("CONSULTANT") // ADMIN | CONSULTANT | VIEWER
+  isActive     Boolean @default(true)
 
   // Job-function tags — a separate dimension from role, exactly as in V1.
   // These gate specific workflow actions (who can act on a Discount/
   // Supervisor review link), not general capabilities, and are always
   // re-fetched fresh from the DB at action time rather than trusted from
   // a JWT — that V1 pattern carries forward unchanged.
-  isSalesConsultant Boolean  @default(false)
-  isCsmoApprover    Boolean  @default(false)
-  isCooApprover     Boolean  @default(false)
-  isSupervisor      Boolean  @default(false)
+  isSalesConsultant Boolean @default(false)
+  isCsmoApprover    Boolean @default(false)
+  isCooApprover     Boolean @default(false)
+  isSupervisor      Boolean @default(false)
 
-  createdAt         DateTime @default(now())
+  createdAt DateTime @default(now())
 
   agreementsCreated Agreement[] @relation("CreatedBy")
   auditLogs         AuditLog[]  @relation("AuditActor")
@@ -60,8 +60,8 @@ model User {
 // check somewhere), but which roles get which permission is pure data —
 // see RolePermission.
 model Permission {
-  id          String @id @default(cuid())
-  key         String @unique
+  id          String  @id @default(cuid())
+  key         String  @unique
   label       String
   description String?
   category    String // groups related permissions in the admin UI
@@ -91,7 +91,7 @@ model RolePermission {
 // entity that issues/signs a document (name, address, signatory, bank
 // details), fully admin-editable, no code-level special cases.
 model Entity {
-  id             String   @id @default(cuid())
+  id             String  @id @default(cuid())
   name           String
   shortName      String
   address1       String?
@@ -102,28 +102,30 @@ model Entity {
   contactEmail   String?
   bankName       String?
   bankAccountNo  String?
-  isActive       Boolean  @default(true)
+  isActive       Boolean @default(true)
 
   updatedById String?
   updatedBy   User?    @relation("EntityUpdatedBy", fields: [updatedById], references: [id])
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  partners  Partner[]
+  partners   Partner[]
   agreements Agreement[]
 }
 
 // Replaces V1's PARTNER_DIRECTORY + every `isGlobe`/`isSterling`-style
-// code special-case. A new partner is a row (+ a rate card once Phase 2
-// lands), never a code branch — this is the concrete mechanism behind the
-// "admin can easily add a new partner" requirement.
+// code special-case. A new partner is a row + a rate card, never a code
+// branch — this is the concrete mechanism behind the "admin can easily
+// add a new partner" requirement.
 model Partner {
-  id       String  @id @default(cuid())
-  name     String  @unique
-  slug     String  @unique
-  entityId String?
-  entity   Entity? @relation(fields: [entityId], references: [id])
-  isActive Boolean @default(true)
+  id                String    @id @default(cuid())
+  name              String    @unique
+  slug              String    @unique
+  entityId          String?
+  entity            Entity?   @relation(fields: [entityId], references: [id])
+  defaultRateCardId String?
+  defaultRateCard   RateCard? @relation(fields: [defaultRateCardId], references: [id])
+  isActive          Boolean   @default(true)
 
   updatedById String?
   updatedBy   User?    @relation("PartnerUpdatedBy", fields: [updatedById], references: [id])
@@ -144,17 +146,17 @@ model Partner {
 // with Phase 2/3's migrations once those models exist, rather than being
 // guessed at now.
 model Agreement {
-  id          String    @id @default(cuid())
-  status      String    @default("DRAFT") // DRAFT | FINALIZED
+  id          String   @id @default(cuid())
+  status      String   @default("DRAFT") // DRAFT | FINALIZED
   companyName String
   partnerId   String?
-  partner     Partner?  @relation(fields: [partnerId], references: [id])
+  partner     Partner? @relation(fields: [partnerId], references: [id])
   entityId    String?
-  entity      Entity?   @relation(fields: [entityId], references: [id])
-  data        Json      @default("{}")
+  entity      Entity?  @relation(fields: [entityId], references: [id])
+  data        Json     @default("{}")
 
   createdById String
-  createdBy   User      @relation("CreatedBy", fields: [createdById], references: [id])
+  createdBy   User   @relation("CreatedBy", fields: [createdById], references: [id])
 
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -181,15 +183,551 @@ model Agreement {
 // "show me this agreement's/user's/partner's history" fast regardless.
 model AuditLog {
   id         String   @id @default(cuid())
-  entityType String   // "Agreement" | "User" | "Entity" | "Partner" | ...
+  entityType String // "Agreement" | "User" | "Entity" | "Partner" | ...
   entityId   String
-  action     String   // "created" | "updated" | "finalized" | "role_changed" | ...
+  action     String // "created" | "updated" | "finalized" | "role_changed" | ...
   actorId    String?
   actor      User?    @relation("AuditActor", fields: [actorId], references: [id])
-  actorName  String   // denormalized display name, kept alongside the FK
-  metadata   Json?    // structured before/after or other action-specific detail
+  actorName  String // denormalized display name, kept alongside the FK
+  metadata   Json? // structured before/after or other action-specific detail
   createdAt  DateTime @default(now())
 
   @@index([entityType, entityId])
   @@index([createdAt])
+}
+
+// =============================================================================
+// PRICING ENGINE (Phase 2)
+// =============================================================================
+//
+// Governing principle: data-configurable INSTANCES, code-owned KINDS. An
+// admin creates unlimited components/products/rate cards/rules with zero
+// deploy; adding a genuinely new shape or condition type is a deliberate
+// code change with tests. This is what keeps the rule grammar closed and
+// safely server-evaluable (a bounded loop over typed rows — no expression
+// parser, no sandboxed eval, nothing admin-authored ever reaches the
+// server as code).
+//
+// Validated against V1's full pricing surface (shared/pricing.js) before
+// being designed — every real V1 shape and rule maps onto this model; see
+// the Pricing Engine section of the architecture plan for the worked
+// examples. Two decisions confirmed with the user during design:
+// monthly/setup fees are separate components (not bundled), and a manual
+// override is the FINAL step — nothing stacks on top of it.
+
+enum PricingShape {
+  FLAT // amount
+  PER_UNIT // rate x qty
+  BASE_PLUS_EXCESS // base covers N, then a flat rate per unit beyond
+  TIER_LOOKUP // cliff: one bracket selected, applied to the whole qty
+  TIER_PROGRESSIVE // marginal: qty split across brackets, summed
+  MULTI_FACTOR // rate x (sum of group1) x (sum of group2) x ...
+}
+
+enum ChargeKind {
+  RECURRING
+  ONE_TIME
+}
+
+enum VatMode {
+  EXCLUSIVE
+  INCLUSIVE
+  NONE
+}
+
+enum PoolingPolicy {
+  PER_ENTITY
+  POOLED
+}
+
+enum QuantityBasis {
+  ENTITY
+  POOLED
+}
+
+enum QuantityBand {
+  TOTAL
+  EXCESS
+}
+
+enum RuleScope {
+  COMPONENT
+  PRODUCT
+  QUOTE_TOTAL
+}
+
+enum RuleOrigin {
+  CATALOG
+  QUOTE
+}
+
+enum EffectType {
+  WAIVE
+  PERCENT_OFF
+  FIXED_OFF
+}
+
+// Note: there is no ALWAYS condition type. A rule with ZERO condition rows
+// is unconditional — that's the structural mechanism behind "HRIS's setup
+// fee is always waived, no lock-in required": the waiver rule simply has
+// no conditions, so it can never again be silently present in one code
+// path and absent from another the way V1's HRIS waiver was.
+enum ConditionType {
+  LOCKIN_YEARS_AT_LEAST
+  TERM_MONTHS_AT_LEAST
+  QUANTITY_AT_LEAST
+  QUANTITY_AT_MOST
+  BILLING_DATE_WITHIN
+  RATE_CARD_IS
+  PRODUCT_SELECTED
+  SETUP_ENABLED
+}
+
+enum ValidationSeverity {
+  WARN
+  BLOCK
+}
+
+// --- Quantity drivers ------------------------------------------------------
+
+// A billable unit ("employees", "branches", "personnel", "trainingDays",
+// ...) is itself a table, not an enum baked into each new product's own
+// field — so a brand-new billable unit is a Back Office row, not a code
+// change. V1 invented one bespoke state field per new unit (employees,
+// branches, kiosks, inventoryModuleBranches, faceToFacePersonnel, ...).
+model QuantityDriver {
+  id          String  @id @default(cuid())
+  key         String  @unique // "employees" | "branches" | "personnel" | "dailyRate" | ...
+  label       String
+  unitLabel   String
+  isPerEntity Boolean @default(true) // false = one value for the whole quote (e.g. dailyRate)
+  isMoney     Boolean @default(false) // true = an input amount, not a count
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+}
+
+// --- Components (structure only — values live on the rate card) -----------
+
+model PricingComponent {
+  id               String  @id @default(cuid())
+  key              String  @unique // "payroll.subscription", "payroll.setup", ...
+  name             String
+  description      String?
+  isActive         Boolean @default(true)
+  currentVersionId String?
+
+  versions         PricingComponentVersion[]
+  productMembers   ProductComponent[]
+  rateCardEntries  RateCardEntry[]
+  componentRules   PricingRule[]
+  quoteAdjustments QuoteAdjustment[]
+  quoteLines       QuoteLine[]
+
+  @@index([key])
+}
+
+model PricingComponentVersion {
+  id          String           @id @default(cuid())
+  componentId String
+  component   PricingComponent @relation(fields: [componentId], references: [id])
+  version     Int
+  isPublished Boolean          @default(false) // published versions are immutable
+
+  shape      PricingShape
+  chargeKind ChargeKind
+
+  quantityDriverKey String?
+  poolingPolicy     PoolingPolicy @default(PER_ENTITY)
+
+  vatMode       VatMode  @default(EXCLUSIVE)
+  vatRatePctPin Decimal? @db.Decimal(6, 3) // null = use the quote's vatRatePct
+
+  // Closed token set for document wording — replaces V1's hand-written
+  // `notes.push(...)` strings scattered through calcGrossForCompanySolution.
+  lineLabelTemplate String?
+  noteTemplate      String?
+
+  createdAt     DateTime  @default(now())
+  publishedAt   DateTime?
+  publishedById String?
+
+  @@unique([componentId, version])
+}
+
+// --- Rate cards (values, never structure) ----------------------------------
+
+model RateCard {
+  id               String     @id @default(cuid())
+  key              String     @unique // "direct" | "partner" | "sterling" | ...
+  name             String
+  inheritsFromId   String?
+  inheritsFrom     RateCard?  @relation("RateCardInheritance", fields: [inheritsFromId], references: [id])
+  inheritedBy      RateCard[] @relation("RateCardInheritance")
+  isActive         Boolean    @default(true)
+  currentVersionId String?
+
+  versions    RateCardVersion[]
+  partners    Partner[]
+  PricingRule PricingRule[]
+}
+
+model RateCardVersion {
+  id            String    @id @default(cuid())
+  rateCardId    String
+  rateCard      RateCard  @relation(fields: [rateCardId], references: [id])
+  version       Int
+  isPublished   Boolean   @default(false)
+  effectiveFrom DateTime?
+  note          String?
+  publishedById String?
+  publishedAt   DateTime?
+
+  entries RateCardEntry[]
+
+  @@unique([rateCardId, version])
+}
+
+model RateCardEntry {
+  id                String           @id @default(cuid())
+  rateCardVersionId String
+  rateCardVersion   RateCardVersion  @relation(fields: [rateCardVersionId], references: [id])
+  componentId       String
+  component         PricingComponent @relation(fields: [componentId], references: [id])
+
+  // Rare escape hatch: lets one rate card use a genuinely different SHAPE
+  // for the same component (Sterling Payroll is a flat per-unit rate while
+  // Globe/LMI Payroll, on the same "payroll.subscription" component, is
+  // base+progressive-tiers — a real V1 case, not a hypothetical one).
+  shapeOverride   PricingShape?
+  config          Json // shape-specific scalars ONLY — see lib/pricing/shapeConfig.js
+  vatModeOverride VatMode?
+  currency        String        @default("PHP")
+
+  tiers RateTier[]
+
+  @@unique([rateCardVersionId, componentId])
+}
+
+// A real child table (not JSON) for variable-length tier lists — this is
+// what structurally eliminates V1's `Infinity`-through-JSON round-trip
+// bugs (reviveExcessTiers, the defensive `max == null` checks scattered
+// through the document builders). `maxUnit: null` means open-ended; never
+// `Infinity`.
+model RateTier {
+  id              String        @id @default(cuid())
+  rateCardEntryId String
+  rateCardEntry   RateCardEntry @relation(fields: [rateCardEntryId], references: [id])
+  sortOrder       Int
+  minUnit         Int
+  maxUnit         Int?
+  value           Decimal       @db.Decimal(14, 4)
+
+  @@unique([rateCardEntryId, sortOrder])
+}
+
+// --- Products (composite bundles of components) ----------------------------
+
+model PricingProduct {
+  id               String  @id @default(cuid())
+  key              String  @unique // "payroll" | "hris" | "accounting" | ...
+  name             String
+  currentVersionId String?
+
+  versions  PricingProductVersion[]
+  offerings OfferingProduct[]
+}
+
+model PricingProductVersion {
+  id          String         @id @default(cuid())
+  productId   String
+  product     PricingProduct @relation(fields: [productId], references: [id])
+  version     Int
+  isPublished Boolean        @default(false)
+
+  members ProductComponent[]
+
+  @@unique([productId, version])
+}
+
+model ProductComponent {
+  id               String                @id @default(cuid())
+  productVersionId String
+  productVersion   PricingProductVersion @relation(fields: [productVersionId], references: [id])
+  componentId      String
+  component        PricingComponent      @relation(fields: [componentId], references: [id])
+  sortOrder        Int
+  isOptional       Boolean               @default(false)
+
+  includeConditions PricingRuleCondition[] @relation("ProductComponentConditions")
+
+  @@unique([productVersionId, componentId])
+}
+
+// Replaces V1's hardcoded businessType dispatch (calcAll/calcAllService/
+// calcAllRcbc/...) — an Offering is what a Consultant actually picks when
+// starting an agreement.
+model Offering {
+  id                   String  @id @default(cuid())
+  key                  String  @unique // "subscription" | "service" | admin-created slug
+  name                 String
+  allowsGroup          Boolean @default(false) // quantity pooling available?
+  allowsTotalDiscount  Boolean @default(true) // resolves V1's real asymmetry deliberately
+  allowsManualOverride Boolean @default(true)
+  isActive             Boolean @default(true)
+
+  products OfferingProduct[]
+}
+
+model OfferingProduct {
+  offeringId String
+  offering   Offering       @relation(fields: [offeringId], references: [id])
+  productId  String
+  product    PricingProduct @relation(fields: [productId], references: [id])
+  isDefault  Boolean        @default(false)
+  sortOrder  Int
+
+  @@id([offeringId, productId])
+}
+
+// --- Rules (catalog-level) and Quote Adjustments (per-agreement) ----------
+
+// Catalog rules and quote adjustments share the same condition/effect
+// grammar (PricingRuleCondition, EffectType) but have deliberately
+// different lifecycles: catalog rules are versioned and published by an
+// Admin and travel into the finalize-time snapshot; quote adjustments
+// belong to one agreement, are authored by a Consultant, and are exactly
+// what the discount-approval workflow (Phase 5) measures. Merging them
+// into one table would mean a nullable-FK soup and a permanent risk of a
+// one-off quote adjustment leaking into the shared catalog.
+model PricingRule {
+  id          String  @id @default(cuid())
+  key         String // stable identity — lets a rate card override just this rule (see below)
+  name        String
+  description String?
+
+  scope       RuleScope
+  componentId String?
+  component   PricingComponent? @relation(fields: [componentId], references: [id])
+  productId   String?
+  offeringId  String?
+
+  // null = applies on every rate card; a rate-card-scoped row with the
+  // same `key` REPLACES the null-scoped row for that card (e.g. Direct's
+  // Payroll setup-fee waiver is disabled entirely by giving it a Direct-
+  // scoped, isActive:false row, while the null-scoped row keeps the
+  // 3-year threshold for everyone else).
+  rateCardId String?
+  rateCard   RateCard? @relation(fields: [rateCardId], references: [id])
+
+  appliesToChargeKind ChargeKind?
+
+  effectType  EffectType
+  effectValue Decimal?   @db.Decimal(14, 4)
+
+  conditions PricingRuleCondition[] @relation("RuleConditions")
+
+  sortOrder     Int       @default(0)
+  isActive      Boolean   @default(true)
+  effectiveFrom DateTime?
+  effectiveTo   DateTime?
+  version       Int       @default(1)
+
+  @@unique([key, rateCardId, version])
+}
+
+model PricingRuleCondition {
+  id                 String             @id @default(cuid())
+  ruleId             String?
+  rule               PricingRule?       @relation("RuleConditions", fields: [ruleId], references: [id])
+  productComponentId String?
+  productComponent   ProductComponent?  @relation("ProductComponentConditions", fields: [productComponentId], references: [id])
+  validationId       String?
+  validation         PricingValidation? @relation("ValidationConditions", fields: [validationId], references: [id])
+
+  type              ConditionType
+  intValue          Int?
+  decimalValue      Decimal?       @db.Decimal(14, 4)
+  dateFrom          DateTime?
+  dateTo            DateTime?
+  quantityDriverKey String?
+  quantityBasis     QuantityBasis?
+  stringValues      String[]
+  boolValue         Boolean?
+}
+
+// Replaces V1's hardcoded warning strings (micro-tier headcount caps,
+// hrisCapExceeded, the missing-partner-rate placeholder note).
+model PricingValidation {
+  id          String             @id @default(cuid())
+  componentId String?
+  productId   String?
+  offeringId  String?
+  severity    ValidationSeverity
+  message     String
+  isActive    Boolean            @default(true)
+
+  conditions PricingRuleCondition[] @relation("ValidationConditions")
+}
+
+// The sales-user side — a per-agreement concession, same grammar as
+// PricingRule but scoped to one quote. This is the entire replacement for
+// V1's discountApprovalPolicy.js's DISCOUNT_FIELD_KEYS hack: baseline =
+// evaluate(CATALOG rules only), actual = evaluate(CATALOG + these), no
+// hardcoded field-name list to keep in sync.
+model QuoteAdjustment {
+  id          String            @id @default(cuid())
+  quoteId     String
+  quote       Quote             @relation(fields: [quoteId], references: [id])
+  scope       RuleScope
+  componentId String?
+  component   PricingComponent? @relation(fields: [componentId], references: [id])
+  productId   String?
+
+  appliesToChargeKind ChargeKind?
+  effectType          EffectType
+  effectValue         Decimal?    @db.Decimal(14, 4)
+
+  windowStart DateTime?
+  windowEnd   DateTime?
+
+  label       String?
+  createdById String
+  createdAt   DateTime @default(now())
+}
+
+// --- Quote (the runtime/pricing-instance side) ------------------------------
+
+model Quote {
+  id          String @id @default(cuid())
+  agreementId String @unique
+
+  offeringId String
+  rateCardId String
+  partnerId  String?
+
+  lockinYears       Int      @default(0)
+  termMonths        Int      @default(12)
+  subscriptionStart DateTime
+  billingLeadDays   Int      @default(5)
+  setupEnabled      Boolean  @default(true)
+  vatRatePct        Decimal  @default(12) @db.Decimal(6, 3)
+  isGroup           Boolean  @default(false)
+
+  manualOverrideEnabled Boolean   @default(false)
+  manualRecurringTotal  Decimal?  @db.Decimal(14, 4)
+  manualOneTimeTotal    Decimal?  @db.Decimal(14, 4)
+  manualOverrideReason  String?
+  manualOverrideById    String?
+  manualOverrideAt      DateTime?
+
+  pinnedRateCardVersionId String?
+  pricingPlanSnapshot     Json?
+  engineVersion           String?
+  snapshotHash            String?
+  snapshotAt              DateTime?
+
+  entities    QuoteEntity[]
+  adjustments QuoteAdjustment[]
+  adHocItems  QuoteAdHocItem[]
+  lines       QuoteLine[]
+  schedule    QuoteScheduleRow[]
+}
+
+model QuoteEntity {
+  id        String  @id @default(cuid())
+  quoteId   String
+  quote     Quote   @relation(fields: [quoteId], references: [id])
+  role      String // "PRIMARY" | "SUBSIDIARY"
+  name      String
+  tin       String?
+  poolOrder Int
+
+  quantities QuoteEntityQuantity[]
+  quoteLines QuoteLine[]
+}
+
+model QuoteEntityQuantity {
+  id            String      @id @default(cuid())
+  quoteEntityId String
+  quoteEntity   QuoteEntity @relation(fields: [quoteEntityId], references: [id])
+  driverKey     String
+  value         Decimal     @db.Decimal(14, 4)
+
+  @@unique([quoteEntityId, driverKey])
+}
+
+// Covers both V1's freeform accountingAddOns (label + fee) and its
+// named-site inventoryModuleProposalBranches (name + quantity + rate) —
+// one table for both, distinguished by whether componentId is set.
+model QuoteAdHocItem {
+  id          String     @id @default(cuid())
+  quoteId     String
+  quote       Quote      @relation(fields: [quoteId], references: [id])
+  componentId String? // set -> unit rate comes from the rate card; null -> unitAmount is freeform
+  label       String
+  quantity    Decimal    @default(1) @db.Decimal(14, 4)
+  unitAmount  Decimal?   @db.Decimal(14, 4)
+  chargeKind  ChargeKind @default(RECURRING)
+  vatMode     VatMode    @default(EXCLUSIVE)
+  sortOrder   Int        @default(0)
+}
+
+// Materialized pricing result — one row per priced line, persisted (not
+// recomputed on every read).
+model QuoteLine {
+  id            String            @id @default(cuid())
+  quoteId       String
+  quote         Quote             @relation(fields: [quoteId], references: [id])
+  componentId   String?
+  component     PricingComponent? @relation(fields: [componentId], references: [id])
+  quoteEntityId String? // null for pooled/whole-quote lines
+  quoteEntity   QuoteEntity?      @relation(fields: [quoteEntityId], references: [id])
+
+  chargeKind ChargeKind
+  label      String
+  note       String?
+
+  quantity      Decimal? @db.Decimal(14, 4)
+  positionStart Int? // pooling attribution
+  positionEnd   Int?
+
+  grossAmount    Decimal @db.Decimal(14, 4)
+  discountAmount Decimal @db.Decimal(14, 4)
+  netAmount      Decimal @db.Decimal(14, 4)
+  vatMode        VatMode
+  vatRatePct     Decimal @db.Decimal(6, 3)
+  vatAmount      Decimal @db.Decimal(14, 4)
+  totalAmount    Decimal @db.Decimal(14, 4)
+
+  breakdown Json // tier split / factor split — what the document table renders
+  sortOrder Int
+
+  applications QuoteLineRuleApplication[]
+}
+
+// "Why is this number what it is" — a free audit trail, and the input to
+// the discount-approval policy (Phase 5).
+model QuoteLineRuleApplication {
+  id                String     @id @default(cuid())
+  quoteLineId       String
+  quoteLine         QuoteLine  @relation(fields: [quoteLineId], references: [id])
+  ruleId            String?
+  quoteAdjustmentId String?
+  origin            RuleOrigin
+  effectType        EffectType
+  amount            Decimal    @db.Decimal(14, 4)
+  note              String?
+}
+
+model QuoteScheduleRow {
+  id          String     @id @default(cuid())
+  quoteId     String
+  quote       Quote      @relation(fields: [quoteId], references: [id])
+  periodIndex Int
+  dueDate     DateTime
+  chargeKind  ChargeKind
+  label       String
+  baseAmount  Decimal    @db.Decimal(14, 4)
+  vatAmount   Decimal    @db.Decimal(14, 4)
+  totalAmount Decimal    @db.Decimal(14, 4)
 }
