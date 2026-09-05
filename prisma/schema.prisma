@@ -51,6 +51,10 @@ model User {
   entitiesUpdated   Entity[]    @relation("EntityUpdatedBy")
   partnersUpdated   Partner[]   @relation("PartnerUpdatedBy")
 
+  reviewRequestsSent       ReviewRequest[] @relation("ReviewRequestedBy")
+  reviewRequestsCsmoActed  ReviewRequest[] @relation("ReviewCsmoActedBy")
+  reviewRequestsFinalActed ReviewRequest[] @relation("ReviewFinalActedBy")
+
   @@index([role])
 }
 
@@ -162,6 +166,8 @@ model Agreement {
   updatedAt   DateTime  @updatedAt
   finalizedAt DateTime?
   deletedAt   DateTime?
+
+  reviewRequests ReviewRequest[]
 
   @@index([status])
   @@index([companyName])
@@ -812,4 +818,89 @@ model DocumentTemplateSection {
   content                   Json // ProseMirror/TipTap-shaped doc tree
 
   @@unique([documentTemplateVersionId, sectionKey])
+}
+
+// --- Review Requests (Phase 5: Discount Approval / Supervisor Review) -----
+
+// A link-based, login-gated approval workflow — carried forward from V1's
+// AgreementReviewRequest essentially as-is (same kinds, same status
+// machine, same tiered CSMO/COO sign-off), since that mechanism was
+// already proven there and the plan explicitly calls for reusing it, not
+// reinventing it. What's genuinely new in V2 is HOW the tier is computed
+// (lib/pricing/discountApproval.js, off the Pricing Engine's catalog-
+// rule-vs-quote-adjustment split) rather than V1's hardcoded discount-
+// field-name list — this model doesn't need to know the difference; it
+// just stores whatever tier/percentages that computation returned.
+enum ReviewRequestKind {
+  // Gated by lib/pricing/discountApproval.js's tiers — needs CSMO (5-10%)
+  // or CSMO-then-COO (over 10%) sign-off before Finalize.
+  DISCOUNT
+  // Purely advisory "did I prepare this correctly?" request — never
+  // blocks Finalize, no tiers, just a Supervisor's note and/or decline.
+  SUPERVISOR
+}
+
+enum ReviewRequestStatus {
+  // Discount, tier CSMO-only, or Supervisor: awaiting that single action.
+  // Discount, tier CSMO-then-COO: awaiting the CSMO's concurrence.
+  PENDING
+  // Discount only: CSMO has concurred, awaiting COO/Finance Head's final approval.
+  AWAITING_COO
+  RESOLVED
+  DECLINED
+}
+
+model ReviewRequest {
+  id     String              @id @default(cuid())
+  token  String              @unique @default(cuid())
+  kind   ReviewRequestKind
+  status ReviewRequestStatus @default(PENDING)
+
+  agreementId String
+  agreement   Agreement @relation(fields: [agreementId], references: [id], onDelete: Cascade)
+
+  requestedById String
+  requestedBy   User    @relation("ReviewRequestedBy", fields: [requestedById], references: [id])
+  justification String? @db.Text
+
+  // The effective % at the moment the request was created — display/audit
+  // only. The tier (and the exact % used to decide it) is always
+  // recomputed LIVE off the agreement's current quote when a decision is
+  // actually made (see the /act route), never off this snapshot, since
+  // the discount may have been edited — up or down — since the link was
+  // created.
+  discountSnapshotPct Float?
+
+  csmoActedById String?
+  csmoActedBy   User?     @relation("ReviewCsmoActedBy", fields: [csmoActedById], references: [id])
+  csmoActedAt   DateTime?
+  csmoNote      String?   @db.Text
+
+  finalActedById String?
+  finalActedBy   User?     @relation("ReviewFinalActedBy", fields: [finalActedById], references: [id])
+  finalActedAt   DateTime?
+  finalNote      String?   @db.Text
+
+  // Set explicitly at the moment a DISCOUNT request resolves — "CSMO" or
+  // "COO", whichever tier actually signed off. Deliberately NOT inferred
+  // from whether csmoActedById/finalActedById differ: one person can
+  // legitimately hold both the CSMO and COO Approver flags, in which case
+  // the same person acts at both stages of a >10% request, and that
+  // inference would wrongly read it back as CSMO-only-covered (a real
+  // bug V1 hit and fixed this same way).
+  resolvedTier       String?
+  // The exact effective % that was actually in effect at the moment of
+  // resolution — NOT just the tier bucket. "Covered" means the CURRENT %
+  // is <= this recorded value, not merely "some request of a sufficient
+  // tier was resolved at some point": a discount raised again after
+  // approval must not be waved through by an old approval for a smaller
+  // amount.
+  resolvedMonthlyPct Float?
+  resolvedSetupPct   Float?
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([agreementId])
+  @@index([status])
 }
