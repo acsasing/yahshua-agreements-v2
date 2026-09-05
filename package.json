@@ -9,6 +9,7 @@
     "postinstall": "prisma generate",
     "seed": "node prisma/seed.mjs",
     "seed:pricing": "node prisma/seedPricing.mjs",
+    "seed:documents": "node prisma/seedDocuments.mjs",
     "test": "vitest run"
   },
   "dependencies": {

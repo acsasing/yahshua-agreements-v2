@@ -731,3 +731,85 @@ model QuoteScheduleRow {
   vatAmount   Decimal    @db.Decimal(14, 4)
   totalAmount Decimal    @db.Decimal(14, 4)
 }
+
+// =============================================================================
+// DOCUMENT TEMPLATING ENGINE (Phase 3)
+// =============================================================================
+//
+// Replaces every hardcoded `buildXHtml` function in V1 (buildDocumentHtml,
+// buildServiceDocumentHtml, buildRcbcAddendumHtml, buildFacialRecognitionHtml,
+// ...) with an admin-authored document: an ordered list of sections, each
+// holding a ProseMirror/TipTap-shaped JSON content tree (the same format the
+// Phase-3 editor UI will both read and write, so there's no separate
+// serialization format to keep in sync). Three custom node types carry the
+// pieces that were genuinely computed code in V1, not admin prose:
+//
+//   - mergeTag        — an inline value resolved from the agreement/entity/
+//                        partner data at render time ({{companyName}}, etc).
+//   - conditionalBlock — a container that only renders when its conditions
+//                        evaluate true. Deliberately reuses the EXACT SAME
+//                        closed condition grammar as the Pricing Engine's
+//                        waiver rules (lib/pricing/rules.js's
+//                        evaluateConditions) rather than inventing a second
+//                        parallel one — conditions are stored inline as
+//                        plain JSON on the node's attrs (the content tree
+//                        is already JSON; a real DB relation mid-tree isn't
+//                        the right fit here the way it is for the Pricing
+//                        Engine's rule tables).
+//   - computedTable   — a placeholder filled in at generation time by the
+//                        Pricing Engine's live QuoteLine/QuoteScheduleRow
+//                        output (V1's Annex A/B pricing and schedule
+//                        tables) — never typed by hand.
+//
+// An Annex is structurally just another Section with a different heading
+// style (annex-title vs. a numbered "III. Term and Termination" heading) —
+// no separate model, matching how V1's own AgreementTemplateSection already
+// treats every section (annexes included) uniformly.
+
+// A document is scoped to an Offering, optionally further scoped to one
+// Partner — a null partnerId is the default every partner uses unless
+// they have their own override row, exactly mirroring V1's
+// AgreementTemplateSection (documentKey + partner) resolution, just
+// promoted from "one editable clause" to "the entire document."
+model DocumentTemplate {
+  id               String  @id @default(cuid())
+  offeringId       String
+  partnerId        String?
+  name             String
+  isActive         Boolean @default(true)
+  currentVersionId String?
+
+  versions DocumentTemplateVersion[]
+
+  @@unique([offeringId, partnerId])
+}
+
+model DocumentTemplateVersion {
+  id          String           @id @default(cuid())
+  templateId  String
+  template    DocumentTemplate @relation(fields: [templateId], references: [id])
+  version     Int
+  isPublished Boolean          @default(false) // published versions are immutable
+
+  createdAt     DateTime  @default(now())
+  publishedAt   DateTime?
+  publishedById String?
+
+  sections DocumentTemplateSection[]
+
+  @@unique([templateId, version])
+}
+
+model DocumentTemplateSection {
+  id                        String                  @id @default(cuid())
+  documentTemplateVersionId String
+  documentTemplateVersion   DocumentTemplateVersion @relation(fields: [documentTemplateVersionId], references: [id])
+  sortOrder                 Int
+  sectionKey                String // stable identity across versions, e.g. "feesAndPayment"
+  title                     String
+  titleEditable             Boolean                 @default(true)
+  kind                      String                  @default("BODY") // "BODY" | "ANNEX"
+  content                   Json // ProseMirror/TipTap-shaped doc tree
+
+  @@unique([documentTemplateVersionId, sectionKey])
+}
