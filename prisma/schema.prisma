@@ -1,0 +1,195 @@
+// YAH V2 — Phase 1 (Foundation) schema.
+// Scope per /root/.claude/plans/eager-leaping-waterfall.md: roles + a real
+// permission matrix, admin-configured Entity/Partner records, a minimal
+// Agreement stub (fleshed out once the Pricing Engine and Document
+// Templating Engine land in Phase 2/3), and an entity-agnostic audit log.
+// Pricing (PricingComponent/Product/RateCard/...), documents
+// (DocumentTemplate/...), and workflow models (ReviewRequest, ClientUser,
+// signature requests) are deliberately NOT in this migration — they belong
+// to their own phases and shouldn't be guessed at ahead of that design work.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("POSTGRES_PRISMA_URL")
+  directUrl = env("POSTGRES_URL_NON_POOLING")
+}
+
+// --- Roles & Permissions -----------------------------------------------
+
+// Three fixed roles (Admin / Consultant / Viewer, per the confirmed V2
+// decision) — kept as a plain string, not a Prisma enum, so the set of
+// *default* permissions per role (RolePermission below) stays admin-
+// editable data. The three role values themselves are still a deliberate,
+// code-owned, closed set (see ROLES in lib/roles.js), not something an
+// admin can invent a fourth one of.
+model User {
+  id                String   @id @default(cuid())
+  email             String   @unique
+  passwordHash      String
+  name              String
+  role              String   @default("CONSULTANT") // ADMIN | CONSULTANT | VIEWER
+  isActive          Boolean  @default(true)
+
+  // Job-function tags — a separate dimension from role, exactly as in V1.
+  // These gate specific workflow actions (who can act on a Discount/
+  // Supervisor review link), not general capabilities, and are always
+  // re-fetched fresh from the DB at action time rather than trusted from
+  // a JWT — that V1 pattern carries forward unchanged.
+  isSalesConsultant Boolean  @default(false)
+  isCsmoApprover    Boolean  @default(false)
+  isCooApprover     Boolean  @default(false)
+  isSupervisor      Boolean  @default(false)
+
+  createdAt         DateTime @default(now())
+
+  agreementsCreated Agreement[] @relation("CreatedBy")
+  auditLogs         AuditLog[]  @relation("AuditActor")
+  entitiesUpdated   Entity[]    @relation("EntityUpdatedBy")
+  partnersUpdated   Partner[]   @relation("PartnerUpdatedBy")
+
+  @@index([role])
+}
+
+// A fine-grained capability string ("agreement.create", "pricing.edit",
+// "template.publish", "user.manage", "report.export", ...). The catalog of
+// keys is code-owned (added with a migration + a matching permission
+// check somewhere), but which roles get which permission is pure data —
+// see RolePermission.
+model Permission {
+  id          String @id @default(cuid())
+  key         String @unique
+  label       String
+  description String?
+  category    String // groups related permissions in the admin UI
+
+  rolePermissions RolePermission[]
+}
+
+// Data-driven default permission set per role — an Admin can adjust what
+// "Consultant" or "Viewer" can do without a code deploy. This table (plus
+// lib/permissions.js's requirePermission() helper) replaces V1's ~20
+// separately copy-pasted `if (!isAdminRole(user.role)) return 403` checks
+// scattered across API route files with one centralized enforcement path.
+model RolePermission {
+  id            String @id @default(cuid())
+  role          String // ADMIN | CONSULTANT | VIEWER
+  permissionKey String
+
+  permission Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@unique([role, permissionKey])
+  @@index([role])
+}
+
+// --- Entities & Partners -------------------------------------------------
+
+// Replaces V1's hardcoded ISSUING_ENTITIES/ABBA_INFO object — the legal
+// entity that issues/signs a document (name, address, signatory, bank
+// details), fully admin-editable, no code-level special cases.
+model Entity {
+  id             String   @id @default(cuid())
+  name           String
+  shortName      String
+  address1       String?
+  address2       String?
+  address3       String?
+  signatoryName  String?
+  signatoryTitle String?
+  contactEmail   String?
+  bankName       String?
+  bankAccountNo  String?
+  isActive       Boolean  @default(true)
+
+  updatedById String?
+  updatedBy   User?    @relation("EntityUpdatedBy", fields: [updatedById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  partners  Partner[]
+  agreements Agreement[]
+}
+
+// Replaces V1's PARTNER_DIRECTORY + every `isGlobe`/`isSterling`-style
+// code special-case. A new partner is a row (+ a rate card once Phase 2
+// lands), never a code branch — this is the concrete mechanism behind the
+// "admin can easily add a new partner" requirement.
+model Partner {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  slug     String  @unique
+  entityId String?
+  entity   Entity? @relation(fields: [entityId], references: [id])
+  isActive Boolean @default(true)
+
+  updatedById String?
+  updatedBy   User?    @relation("PartnerUpdatedBy", fields: [updatedById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agreements Agreement[]
+}
+
+// --- Agreements (minimal stub for Phase 1) --------------------------------
+
+// Deliberately minimal for this phase. `data` keeps the same
+// flexible-JSON spirit as V1's `Agreement.state` blob (agreement-instance
+// data genuinely varies by document type, and this keeps V1 migration
+// straightforward), but `partnerId`/`entityId` are real FKs from day one
+// instead of V1's string/boolean flags. `documentTemplateId` and
+// `quoteId` (Pricing Engine) are intentionally NOT here yet — they land
+// with Phase 2/3's migrations once those models exist, rather than being
+// guessed at now.
+model Agreement {
+  id          String    @id @default(cuid())
+  status      String    @default("DRAFT") // DRAFT | FINALIZED
+  companyName String
+  partnerId   String?
+  partner     Partner?  @relation(fields: [partnerId], references: [id])
+  entityId    String?
+  entity      Entity?   @relation(fields: [entityId], references: [id])
+  data        Json      @default("{}")
+
+  createdById String
+  createdBy   User      @relation("CreatedBy", fields: [createdById], references: [id])
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  finalizedAt DateTime?
+  deletedAt   DateTime?
+
+  @@index([status])
+  @@index([companyName])
+}
+
+// --- Audit log -------------------------------------------------------------
+
+// Entity-agnostic (V1's was Agreement-only), a real actor FK (V1 only kept
+// a denormalized name string), and a structured action type — replacing
+// V1's free-text `action` string and its silently-swallowed write
+// failures (lib/auditLog.js's bare `catch {}`).
+//
+// `entityType`/`entityId` are a soft polymorphic reference (Prisma has no
+// native polymorphic relation), deliberately NOT a real foreign key — a
+// hard FK to any one entity table would make every OTHER entity type's
+// audit rows fail that constraint, defeating the entity-agnostic design.
+// Application code is responsible for the entityType/entityId pairing
+// being valid; the (entityType, entityId) index below is what keeps
+// "show me this agreement's/user's/partner's history" fast regardless.
+model AuditLog {
+  id         String   @id @default(cuid())
+  entityType String   // "Agreement" | "User" | "Entity" | "Partner" | ...
+  entityId   String
+  action     String   // "created" | "updated" | "finalized" | "role_changed" | ...
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id])
+  actorName  String   // denormalized display name, kept alongside the FK
+  metadata   Json?    // structured before/after or other action-specific detail
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
